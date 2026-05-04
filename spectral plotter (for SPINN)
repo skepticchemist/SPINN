@@ -1,0 +1,958 @@
+# -*- coding: utf-8 -*-
+"""
+==================================================================
+                     SPECTRAL PLOTTER
+==================================================================
+*should be able to plot any data given*
+-including .cat from SPCAT
+-THIS IS THE MAIN PLOTTER FOR SPINN
+-This code was written initially for the waveform format.*
+"""
+
+import sys
+import os
+import csv
+import json
+import struct
+import numpy as np
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
+
+# -----------------------------------------------------------------------------
+# ADVANCED MATH FUNCTIONS
+# -----------------------------------------------------------------------------
+def apply_hanning_filter(y, window_size=5):
+    window = np.hanning(window_size)
+    window = window / window.sum()
+    return np.convolve(y, window, mode='same')
+
+def asymmetric_least_squares(y, lam=1e6, p=0.001, niter=10):
+    L = len(y)
+    D = sparse.diags([1, -2, 1], [0, -1, -2], shape=(L, L-2))
+    D = lam * D.dot(D.transpose())
+    w = np.ones(L)
+    for i in range(niter):
+        W = sparse.spdiags(w, 0, L, L)
+        Z = W + D
+        z = spsolve(Z, w * y)
+        w = p * (y > z) + (1 - p) * (y < z)
+    return z
+
+# -----------------------------------------------------------------------------
+# CUSTOM TOOLBAR
+# -----------------------------------------------------------------------------
+class CustomToolbar(NavigationToolbar2Tk):
+    toolitems = [t for t in NavigationToolbar2Tk.toolitems if
+                 t[0] in ('Home', 'Back', 'Forward', 'Pan', 'Zoom') or t[0] is None]
+
+# -----------------------------------------------------------------------------
+# ROBUST DATA READER (NOW WITH WFM INTEGRATION)
+# -----------------------------------------------------------------------------
+def parse_file_content(filename):
+    x_list, y_list = [], []
+    is_log_scale = False
+    if not filename: return np.array([]), np.array([])
+    
+    try:
+        # 1. LabVIEW .wfm Binary Format Integration
+        if filename.lower().endswith('.wfm'):
+            folder_path = os.path.dirname(filename)
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+            par_file_path = os.path.join(folder_path, base_name + ".par")
+            
+            par_start, par_stop = None, None
+            if os.path.exists(par_file_path):
+                with open(par_file_path, 'r') as p:
+                    lines = [line.strip() for line in p.readlines() if line.strip()]
+                    if len(lines) >= 2:
+                        par_start = float(lines[0])
+                        par_stop = float(lines[1])
+
+            with open(filename, 'rb') as f:
+                raw_bytes = f.read()
+
+            arrays_found = []
+            array_starts = []
+            i = 0
+            while i < len(raw_bytes) - 8:
+                N = struct.unpack('>i', raw_bytes[i:i+4])[0]
+                if 10 < N < 10000000 and i + 4 + (N * 8) <= len(raw_bytes):
+                    first_float = struct.unpack('>d', raw_bytes[i+4:i+12])[0]
+                    if np.isfinite(first_float) and abs(first_float) < 1e15:
+                        floats = np.frombuffer(raw_bytes[i+4 : i+4+(N*8)], dtype='>f8')
+                        if np.sum(np.isfinite(floats) & (np.abs(floats) < 1e15)) == N:
+                            arrays_found.append(floats)
+                            array_starts.append(i)
+                            i += 4 + (N * 8)
+                            continue
+                i += 1
+
+            for idx in range(len(arrays_found)):
+                Y_chunk = arrays_found[idx]
+                array_start = array_starts[idx]
+                N_points = len(Y_chunk)
+                
+                true_t0, true_dt = None, None
+                try:
+                    true_dt = struct.unpack('>d', raw_bytes[array_start-8 : array_start])[0]
+                    sec, frac = struct.unpack('>qQ', raw_bytes[array_start-24 : array_start-8])
+                    true_t0 = sec + (frac / (2**64))
+                except Exception:
+                    pass
+
+                if true_t0 is not None and true_dt is not None and true_dt > 0:
+                    X_chunk = true_t0 + (np.arange(N_points) * true_dt)
+                    x_list.extend(X_chunk)
+                    y_list.extend(Y_chunk)
+                elif par_start is not None and par_stop is not None and len(arrays_found) == 1:
+                    exact_step = (par_stop - par_start) / N_points
+                    X_chunk = par_start + (np.arange(N_points) * exact_step)
+                    x_list.extend(X_chunk)
+                    y_list.extend(Y_chunk)
+
+            if len(x_list) > 0:
+                df = pd.DataFrame({"X": x_list, "Y": y_list})
+                df = df.sort_values(by="X").drop_duplicates(subset="X").reset_index(drop=True)
+                return df["X"].to_numpy(), df["Y"].to_numpy()
+            return np.array([]), np.array([])
+
+        # 2. SPCAT .cat file format (Log base 10 intensity in column 3)
+        elif filename.lower().endswith('.cat'):
+            with open(filename, 'r', errors='ignore') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            freq = float(parts[0])
+                            log_int = float(parts[2]) 
+                            x_list.append(freq)
+                            y_list.append(10 ** log_int)  
+                        except ValueError:
+                            continue
+            return np.array(x_list), np.array(y_list)
+
+        # 3. .freq file format (Strictly read as-is, NO scaling)
+        elif filename.lower().endswith(('.freq', '.pred')):
+            with open(filename, 'r', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'): continue
+                    parts = line.replace(',', ' ').split()
+                    if len(parts) >= 2:
+                        try:
+                            x_list.append(float(parts[0]))
+                            y_list.append(float(parts[1]))
+                        except ValueError:
+                            continue
+            return np.array(x_list), np.array(y_list)
+
+        # 4. Standard file fallback
+        else:
+            with open(filename, 'r', errors='ignore') as f:
+                lines = f.readlines()
+                for line in lines[:20]:
+                    if "LogInt" in line or "Log Int" in line:
+                        is_log_scale = True
+                        break
+                for line in lines:
+                    line = line.strip()
+                    if not line: continue 
+                    parts = line.replace(',', ' ').split()
+                    if len(parts) < 2: continue
+                    try:
+                        x_list.append(float(parts[0]))
+                        y_list.append(float(parts[1]))
+                    except ValueError:
+                        continue
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return np.array([]), np.array([])
+
+    x_arr, y_arr = np.array(x_list), np.array(y_list)
+    if is_log_scale and len(y_arr) > 0:
+        try: y_arr = 10.0 ** y_arr
+        except: pass
+        
+    return x_arr, y_arr
+
+# -----------------------------------------------------------------------------
+# MAIN APP
+# -----------------------------------------------------------------------------
+class SpectrumApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Universal Spectrum Plotter 10+ (Peak finder & cheap Loomis-Woods)")
+        self.geometry("1400x850") 
+
+        self.top_x, self.top_y = [], []
+        self.bot_x, self.bot_y = [], []
+        
+        self.selections = []      
+        self.selected_freqs = []  
+        self.peak_data = [] 
+
+        self.current_ymax = 1.1
+        self.current_ymin = -1.1
+        self.pred_state = 0 # 0: Butterfly, 1: Overlap, 2: Stacked
+
+        # --- 1. Top Controls (File & View) ---
+        frame_files = tk.Frame(self, bg="#f0f0f0", bd=1, relief="raised")
+        frame_files.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Button(frame_files, text="Load Exp (Top)", command=self.load_top, bg="white").pack(side=tk.LEFT, padx=(10, 2), pady=5)
+        tk.Button(frame_files, text="Convert Exp -> .dat", command=self.export_exp_to_dat, bg="#cce5ff").pack(side=tk.LEFT, padx=(2, 10), pady=5)
+        
+        tk.Button(frame_files, text="Load Pred (Bottom)", command=self.load_bot, bg="white").pack(side=tk.LEFT, padx=10, pady=5)
+        
+        self.btn_toggle = tk.Button(frame_files, text="Pred View: Butterfly", command=self.toggle_pred_dir, bg="#e2e3e5")
+        self.btn_toggle.pack(side=tk.LEFT, padx=10, pady=5)
+        
+        tk.Button(frame_files, text="Export Clean Image", command=self.export_clean_plot, bg="#d4edda").pack(side=tk.LEFT, padx=20, pady=5)
+        tk.Button(frame_files, text="Clear Lines", command=self.clear_lines, bg="#ffcccc").pack(side=tk.RIGHT, padx=10, pady=5)
+
+        self.lbl_info = tk.Label(frame_files, text="Load files to begin.", bg="#f0f0f0")
+        self.lbl_info.pack(side=tk.LEFT, padx=10)
+
+        # --- 2. Intensity Scale Controls ---
+        frame_scale = tk.Frame(self, bg="#e8f4f8", bd=1, relief="ridge")
+        frame_scale.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+
+        tk.Label(frame_scale, text="Exp Intensity (Top):", bg="#e8f4f8", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(10, 5))
+        tk.Button(frame_scale, text="  -  ", command=self.dec_exp, bg="#ffcccc").pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_scale, text="  +  ", command=self.inc_exp, bg="#cce5ff").pack(side=tk.LEFT, padx=2)
+
+        tk.Label(frame_scale, text="Pred Intensity (Bot):", bg="#e8f4f8", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(30, 5))
+        tk.Button(frame_scale, text="  -  ", command=self.dec_pred, bg="#ffcccc").pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_scale, text="  +  ", command=self.inc_pred, bg="#cce5ff").pack(side=tk.LEFT, padx=2)
+
+        tk.Button(frame_scale, text="Reset Y-Scale", command=self.reset_scales, bg="white").pack(side=tk.LEFT, padx=30)
+
+        # --- 3. Advanced Peak Finder & AI Controls ---
+        frame_peaks = tk.Frame(self, bg="#ffeeba", bd=1, relief="ridge")
+        frame_peaks.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+
+        tk.Button(frame_peaks, text="Find Peaks", command=self.find_all_zoomed_pairs, bg="#ffc107", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5, pady=5)
+        tk.Button(frame_peaks, text="Baseline", command=self.auto_baseline_analyze, bg="lightgreen").pack(side=tk.LEFT, padx=2)
+        tk.Button(frame_peaks, text="Loomis", command=self.open_loomis_woods, bg="#85c1e9").pack(side=tk.LEFT, padx=2)
+        
+        # ---> ADDED PREDICT J+1 BUTTON <---
+        tk.Button(frame_peaks, text="Predict J+1 Band", command=self.predict_j_plus_1, bg="#e8daef", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(frame_peaks, text="Sens(%):", bg="#ffeeba").pack(side=tk.LEFT, padx=(10,0))
+        self.prom_slider = tk.Scale(frame_peaks, from_=0.1, to=15.0, resolution=0.1, orient=tk.HORIZONTAL, bg="#ffeeba", length=80)
+        self.prom_slider.set(2.0)
+        self.prom_slider.pack(side=tk.LEFT, padx=2)
+
+        tk.Label(frame_peaks, text="Split:", bg="#ffeeba").pack(side=tk.LEFT, padx=(5,0))
+        self.max_split_var = tk.StringVar(value="1.0")
+        tk.Entry(frame_peaks, textvariable=self.max_split_var, width=4).pack(side=tk.LEFT)
+
+        tk.Label(frame_peaks, text="H-Diff(%):", bg="#ffeeba").pack(side=tk.LEFT, padx=(5,0))
+        self.max_hdiff_var = tk.StringVar(value="60")
+        tk.Entry(frame_peaks, textvariable=self.max_hdiff_var, width=4).pack(side=tk.LEFT)
+
+        tk.Label(frame_peaks, text=" | ", bg="#ffeeba", font=("Arial", 12, "bold")).pack(side=tk.LEFT)
+        tk.Button(frame_peaks, text="Auto-Assign Pattern (.freq)", command=self.auto_assign, bg="#85c1e9", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5, pady=5)
+        
+        tk.Label(frame_peaks, text="Pattern Tol (MHz):", bg="#ffeeba").pack(side=tk.LEFT, padx=(5,0))
+        self.assign_tol_var = tk.StringVar(value="1.0") 
+        tk.Entry(frame_peaks, textvariable=self.assign_tol_var, width=5).pack(side=tk.LEFT, padx=2)
+
+        # --- 4. Main Middle Section (Plot Area + Info Panel) ---
+        frame_middle = tk.Frame(self)
+        frame_middle.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # 4a. Left Side: The Plot 
+        frame_plot = tk.Frame(frame_middle)
+        frame_plot.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.fig = Figure(figsize=(8, 5), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_xlabel("Frequency (MHz)")
+        self.ax.set_ylabel("Intensity")
+        self.ax.grid(True, linestyle="--", alpha=0.3)
+        
+        # ---> FORCE PLAIN NUMBERS ON X-AXIS (DISABLE SCIENTIFIC/OFFSET) <---
+        self.ax.ticklabel_format(useOffset=False, style='plain', axis='x')
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=frame_plot)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.toolbar = CustomToolbar(self.canvas, frame_plot)
+        self.toolbar.update()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("button_press_event", self.on_click)
+
+        # 4b. Right Side: Info Panel 
+        frame_info = tk.Frame(frame_middle, width=220, bg="#f8f9fa", bd=2, relief="sunken")
+        frame_info.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        frame_info.pack_propagate(False) # Prevents the frame from shrinking around widgets
+        
+        tk.Label(frame_info, text="Exp Parameters", bg="#f8f9fa", font=("Arial", 11, "bold", "underline"), fg="#333").pack(pady=(10, 10))
+        
+        self.info_labels = {}
+        info_fields = ["File", "Data Points", "Start Freq", "Stop Freq", "Step Size", "Shots / Avg"]
+        
+        for field in info_fields:
+            lbl_title = tk.Label(frame_info, text=f"{field}:", bg="#f8f9fa", font=("Arial", 9, "bold"), fg="#555")
+            lbl_title.pack(anchor="w", padx=10, pady=(5, 0))
+            
+            lbl_val = tk.Label(frame_info, text="---", bg="#f8f9fa", font=("Courier", 10), fg="#0056b3", wraplength=180, justify="left")
+            lbl_val.pack(anchor="w", padx=20)
+            self.info_labels[field] = lbl_val
+
+        # --- 5. Bottom Log Box ---
+        frame_bottom = tk.Frame(self, bg="#e1e1e1", height=150)
+        frame_bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        tk.Label(frame_bottom, text="Measurement Log:", bg="#e1e1e1", font=("Arial", 10, "bold")).pack(side=tk.TOP, anchor="w", padx=10, pady=2)
+
+        self.log_list = tk.Listbox(frame_bottom, height=8, font=("Courier", 10))
+        scrollbar = tk.Scrollbar(frame_bottom, orient="vertical", command=self.log_list.yview)
+        self.log_list.config(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        tk.Button(frame_bottom, text="Export Peaks", command=self.export_peaks_data, bg="#cce5ff", font=("Arial", 9, "bold")).pack(side=tk.RIGHT, padx=10, pady=10)
+        tk.Button(frame_bottom, text="Copy Log", command=self.copy_to_clipboard, bg="#ddffdd").pack(side=tk.RIGHT, padx=5, pady=10)
+        tk.Button(frame_bottom, text="Clear Log", command=self.clear_log, bg="#ffdddd").pack(side=tk.RIGHT, padx=5, pady=10)
+
+    # ---------------------------------------------------------
+    # LOADING, METADATA & DRAWING
+    # ---------------------------------------------------------
+    def load_top(self):
+        fname = filedialog.askopenfilename(title="Select Experimental File", filetypes=[("Waveform Files", "*.wfm"), ("All Files", "*.*")])
+        if fname:
+            x, y = parse_file_content(fname)
+            if len(x) > 0:
+                self.top_x, self.top_y = x, y
+                self.lbl_info.config(text=f"Loaded Top: {os.path.basename(fname)} ({len(x)} pts)")
+                self.update_info_panel(fname, x) 
+                self.redraw_plot()
+                if fname.lower().endswith('.wfm'):
+                    self.log_list.insert(tk.END, f"[WFM Loaded] Automatically aligned X-axis for {os.path.basename(fname)}")
+                    self.log_list.yview(tk.END)
+
+    def update_info_panel(self, fname, x):
+        if len(x) == 0: return
+        self.info_labels["File"].config(text=os.path.basename(fname))
+        self.info_labels["Data Points"].config(text=f"{len(x):,}")
+        self.info_labels["Start Freq"].config(text=f"{np.min(x):.4f} MHz")
+        self.info_labels["Stop Freq"].config(text=f"{np.max(x):.4f} MHz")
+        
+        step = abs(x[1] - x[0]) if len(x) > 1 else 0
+        self.info_labels["Step Size"].config(text=f"{step:.6f} MHz")
+        
+        shots = "Unknown"
+        par_path = os.path.splitext(fname)[0] + ".par"
+        if os.path.exists(par_path):
+            try:
+                with open(par_path, 'r') as p:
+                    lines = [line.strip() for line in p.readlines() if line.strip()]
+                    if len(lines) >= 4: shots = lines[3] 
+                    elif len(lines) == 3: shots = lines[2]
+            except Exception: pass
+            
+        self.info_labels["Shots / Avg"].config(text=shots)
+
+    def export_exp_to_dat(self):
+        if len(self.top_x) == 0:
+            self.log_list.insert(tk.END, "ERROR: No Experimental Data loaded to convert.")
+            self.log_list.yview(tk.END)
+            return
+            
+        fname = filedialog.asksaveasfilename(
+            title="Convert and Save as .dat",
+            defaultextension=".dat", 
+            filetypes=[("DAT Data", "*.dat")]
+        )
+        if not fname: return
+        
+        try:
+            df = pd.DataFrame({"Frequency_X": self.top_x, "Intensity_Y": self.top_y})
+            df = df.sort_values(by="Frequency_X").drop_duplicates(subset="Frequency_X").reset_index(drop=True)
+            df["Frequency_X"] = df["Frequency_X"].map('{:.6f}'.format)
+            df.to_csv(fname, sep='\t', index=False)
+            
+            self.log_list.insert(tk.END, f">>> SUCCESS: Saved converted experimental data to {os.path.basename(fname)}")
+            self.log_list.yview(tk.END)
+        except Exception as e:
+            self.log_list.insert(tk.END, f"ERROR converting file: {e}")
+            self.log_list.yview(tk.END)
+
+    def load_bot(self):
+        fname = filedialog.askopenfilename(title="Select Prediction File", filetypes=[("All Files", "*.*"), ("CAT files", "*.cat")])
+        if fname:
+            x, y = parse_file_content(fname)
+            if len(x) > 0:
+                self.bot_x, self.bot_y = x, y
+                self.lbl_info.config(text=f"Loaded Bot: {os.path.basename(fname)} ({len(x)} pts)")
+                self.redraw_plot()
+
+    def redraw_plot(self):
+        self.ax.clear()
+        
+        if len(self.top_x) > 0:
+            y_norm = self.top_y / np.max(self.top_y)
+            self.ax.plot(self.top_x, y_norm, color="black", lw=1.0, label="Experimental")
+            
+        if len(self.bot_x) > 0:
+            max_y = np.max(self.bot_y) if np.max(self.bot_y) != 0 else 1
+            y_norm = self.bot_y / max_y
+            
+            if self.pred_state == 0:     
+                baseline, mult = 0.0, -1.0
+                self.current_ymin = -1.1
+            elif self.pred_state == 1:   
+                baseline, mult = 0.0, 1.0
+                self.current_ymin = -0.1
+            else:                        
+                baseline, mult = -1.1, 1.0
+                self.current_ymin = -2.2
+            
+            y_scaled = mult * y_norm
+            ymin = np.minimum(baseline, baseline + y_scaled)
+            ymax = np.maximum(baseline, baseline + y_scaled)
+            self.ax.vlines(self.bot_x, ymin, ymax, color="red", linewidth=1.2)
+            
+            if self.pred_state == 2:
+                self.ax.axhline(baseline, color='gray', linewidth=0.8, linestyle=':')
+        else:
+            self.current_ymin = -0.1
+            
+        self.current_ymax = 1.1
+        self.ax.set_ylim(self.current_ymin, self.current_ymax)
+
+        self.ax.axhline(0, color='gray', linewidth=0.8)
+        self.ax.grid(True, linestyle="--", alpha=0.3)
+        self.ax.set_xlabel("Frequency (MHz)")
+        
+        # ---> FORCE PLAIN NUMBERS ON X-AXIS DURING REDRAW <---
+        self.ax.ticklabel_format(useOffset=False, style='plain', axis='x')
+        
+        self.canvas.draw()
+
+    def toggle_pred_dir(self):
+        self.pred_state = (self.pred_state + 1) % 3
+        modes = ["Butterfly", "Overlap", "Stacked"]
+        self.btn_toggle.config(text=f"Pred View: {modes[self.pred_state]}")
+        self.redraw_plot()
+
+    # ---------------------------------------------------------
+    # INTENSITY SCALING LOGIC 
+    # ---------------------------------------------------------
+    def inc_exp(self):
+        self.current_ymax /= 1.5
+        self.ax.set_ylim(self.current_ymin, self.current_ymax)
+        self.canvas.draw()
+
+    def dec_exp(self):
+        self.current_ymax *= 1.5
+        self.ax.set_ylim(self.current_ymin, self.current_ymax)
+        self.canvas.draw()
+
+    def inc_pred(self):
+        self.current_ymin /= 1.5
+        self.ax.set_ylim(self.current_ymin, self.current_ymax)
+        self.canvas.draw()
+
+    def dec_pred(self):
+        self.current_ymin *= 1.5
+        self.ax.set_ylim(self.current_ymin, self.current_ymax)
+        self.canvas.draw()
+
+    def reset_scales(self):
+        self.current_ymax = 1.1
+        if self.pred_state == 0: self.current_ymin = -1.1
+        elif self.pred_state == 1: self.current_ymin = -0.1
+        else: self.current_ymin = -2.2
+        self.ax.set_ylim(self.current_ymin, self.current_ymax)
+        self.canvas.draw()
+
+    # ---------------------------------------------------------
+    # EXPORT CLEAN IMAGE LOGIC
+    # ---------------------------------------------------------
+    def export_clean_plot(self):
+        fname = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG Image", "*.png"), ("PDF Document", "*.pdf")])
+        if not fname: return
+        current_xlim = self.ax.get_xlim()
+        current_ylim = self.ax.get_ylim()
+        fig, ax = plt.subplots(figsize=(8, 4), dpi=300)
+        
+        if len(self.top_x) > 0:
+            y_norm = self.top_y / np.max(self.top_y)
+            ax.plot(self.top_x, y_norm, color="black", lw=1.0)
+            
+        if len(self.bot_x) > 0:
+            max_y = np.max(self.bot_y) if np.max(self.bot_y) != 0 else 1
+            y_norm = self.bot_y / max_y
+            
+            if self.pred_state == 0: baseline, mult = 0.0, -1.0
+            elif self.pred_state == 1: baseline, mult = 0.0, 1.0
+            else: baseline, mult = -1.1, 1.0
+                
+            y_scaled = mult * y_norm
+            ymin = np.minimum(baseline, baseline + y_scaled)
+            ymax = np.maximum(baseline, baseline + y_scaled)
+            ax.vlines(self.bot_x, ymin, ymax, color="red", linewidth=1.0)
+            
+            if self.pred_state == 2:
+                ax.axhline(baseline, color='gray', linewidth=0.5, linestyle=':')
+        
+        for artist in self.selections:
+            if isinstance(artist, plt.Line2D):
+                x = artist.get_xdata()[0]
+                color, linestyle = artist.get_color(), artist.get_linestyle()
+                ax.axvline(x=x, color=color, linestyle=linestyle, linewidth=1.5, alpha=0.8)
+            elif isinstance(artist, plt.Text):
+                x, y, text = artist.get_position()[0], artist.get_position()[1], artist.get_text()
+                bbox = artist.get_bbox_patch()
+                if bbox:
+                    color = artist.get_color()
+                    ax.text(x, y, text, color=color, fontweight="bold", ha="center", va="bottom",
+                            bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor=color))
+                else:
+                    ax.text(x, y, text, rotation=90, color="green", verticalalignment='bottom', backgroundcolor='white')
+
+        ax.set_xlim(current_xlim)
+        ax.set_ylim(current_ylim)
+        ax.axhline(0, color='black', linewidth=1.0)
+        ax.set_xlabel("Frequency (MHz)", fontsize=12)
+        ax.set_ylabel("Intensity", fontsize=12)
+        
+        ax.ticklabel_format(useOffset=False, style='plain', axis='x')
+        
+        ax.grid(False)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        plt.tight_layout()
+        plt.savefig(fname, bbox_inches='tight')
+        plt.close(fig)
+
+    # ---------------------------------------------------------
+    # NEW ADVANCED FEATURES (Baseline, Loomis-Woods, Predict J+1, Peaks)
+    # ---------------------------------------------------------
+    def auto_baseline_analyze(self):
+        """Advanced ALS Baseline + Smoothing"""
+        if len(self.top_y) == 0: return
+        smoothed = apply_hanning_filter(self.top_y)
+        baseline = asymmetric_least_squares(smoothed)
+        self.ax.plot(self.top_x, baseline / np.max(self.top_y), "r--", alpha=0.5, label="Baseline")
+        self.canvas.draw()
+
+    def open_loomis_woods(self):
+        """Generates a Loomis-Woods plot in a new window based on a user-defined spacing."""
+        if len(self.top_x) == 0:
+            messagebox.showwarning("No Data", "Please load experimental data (Top) first.")
+            return
+
+        spacing = simpledialog.askfloat("Loomis-Woods Spacing", 
+                                        "Enter the expected spacing (e.g., 2B) in MHz:\n(Example: 2500.5)",
+                                        parent=self, minvalue=0.1)
+        if not spacing: return 
+
+        prominence_thresh = self.prom_slider.get() / 100.0
+        norm_y = self.top_y / np.max(self.top_y)
+        peaks_indices, _ = find_peaks(norm_y, prominence=prominence_thresh)
+        
+        if len(peaks_indices) == 0:
+            messagebox.showinfo("No Peaks", "No peaks found at current sensitivity. Lower the threshold.")
+            return
+
+        peak_freqs = self.top_x[peaks_indices]
+        peak_ints = norm_y[peaks_indices]
+
+        start_freq = peak_freqs[0]
+        lw_x = (peak_freqs - start_freq) % spacing 
+        lw_y = (peak_freqs - start_freq) // spacing 
+
+        lw_window = tk.Toplevel(self)
+        lw_window.title(f"Loomis-Woods Plot (Spacing: {spacing} MHz)")
+        lw_window.geometry("800x600")
+
+        fig = Figure(figsize=(7, 5), dpi=100)
+        ax = fig.add_subplot(111)
+        scatter = ax.scatter(lw_x, lw_y, c=peak_ints, s=peak_ints*100, cmap='viridis', alpha=0.8, edgecolors='none')
+        
+        ax.set_xlabel(f"Frequency mod {spacing} (MHz)")
+        ax.set_ylabel("Segment Index (m)")
+        ax.set_title(f"Loomis-Woods Analysis")
+        ax.grid(True, linestyle='--', alpha=0.5)
+        fig.colorbar(scatter, ax=ax, label="Relative Intensity")
+
+        canvas = FigureCanvasTkAgg(fig, master=lw_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(canvas, lw_window)
+        toolbar.update()
+
+    def predict_j_plus_1(self):
+        """Predicts the next transitions in a rigid rotor band based on a starting frequency and J+1"""
+        default_freq = ""
+        if len(self.selected_freqs) > 0:
+            default_freq = f"{self.selected_freqs[-1]:.4f}"
+
+        freq_str = simpledialog.askstring("Starting Frequency", 
+                                          "Enter the frequency of the line (MHz):",
+                                          initialvalue=default_freq, parent=self)
+        if not freq_str: return
+        
+        j_str = simpledialog.askinteger("Input J+1", 
+                                        "Enter the (J+1) integer value for this line:", 
+                                        parent=self, minvalue=1)
+        if not j_str: return
+        
+        try:
+            freq = float(freq_str)
+            j_plus_1 = int(j_str)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid number entered.")
+            return
+            
+        two_B = freq / j_plus_1
+        
+        self.log_list.insert(tk.END, "")
+        self.log_list.insert(tk.END, f"=== PREDICTED J+1 BAND (Calculated 2B = {two_B:.4f} MHz) ===")
+        
+        for i in range(1, 9):
+            next_j_plus_1 = j_plus_1 + i
+            next_freq = two_B * next_j_plus_1
+            
+            line = self.ax.axvline(x=next_freq, color='magenta', linestyle='-.', linewidth=1.5, alpha=0.8)
+            self.selections.append(line)
+            
+            t = self.ax.text(next_freq, 0.95, f"J+1={next_j_plus_1}", rotation=90, color="magenta", 
+                             verticalalignment='top', backgroundcolor='white', transform=self.ax.get_xaxis_transform())
+            self.selections.append(t)
+            
+            self.log_list.insert(tk.END, f"Predicted J+1={next_j_plus_1} : {next_freq:.4f} MHz")
+            
+        current_xmin, current_xmax = self.ax.get_xlim()
+        max_pred = two_B * (j_plus_1 + 8)
+        min_pred = two_B * (j_plus_1 + 1)
+        self.ax.set_xlim(min(current_xmin, min_pred - 100), max(current_xmax, max_pred + 100))
+        
+        self.log_list.yview(tk.END)
+        self.canvas.draw()
+
+    def find_all_zoomed_pairs(self):
+        """Finds peaks and intelligently determines if they are single lines or pairs"""
+        if len(self.top_x) == 0: return
+        
+        try:
+            prominence_thresh = self.prom_slider.get() / 100.0
+            split_threshold = float(self.max_split_var.get())
+        except ValueError: return
+        
+        x_min, x_max = self.ax.get_xlim()
+        mask = (self.top_x >= x_min) & (self.top_x <= x_max)
+        if not np.any(mask): return
+        
+        # ---> FIX: Use local maximum so small peaks in zoomed area are found! <---
+        local_max = np.max(self.top_y[mask]) 
+        if local_max == 0: local_max = 1
+        
+        x_zoomed, y_zoomed = self.top_x[mask], self.top_y[mask] / local_max
+        peaks_indices, _ = find_peaks(y_zoomed, prominence=prominence_thresh)
+        
+        found_freqs = x_zoomed[peaks_indices]
+        found_y = y_zoomed[peaks_indices]
+        
+        i = 0
+        while i < len(found_freqs):
+            f1 = found_freqs[i]
+            
+            # Check if there is a next peak AND if it falls within the Doppler split threshold
+            if i + 1 < len(found_freqs) and abs(found_freqs[i+1] - f1) <= split_threshold:
+                # Pair detected
+                f2 = found_freqs[i+1]
+                center = (f1 + f2) / 2.0
+                split = abs(f1 - f2)
+                
+                line = self.ax.axvline(x=center, color='purple', linestyle='--', alpha=0.8)
+                self.selections.append(line)
+                
+                log_entry = f"AUTO Pair   | Center: {center:.4f} | Split: {split:.4f}"
+                self.log_list.insert(tk.END, log_entry)
+                self.log_list.yview(tk.END)
+                
+                self.peak_data.append({
+                    "Type": "Auto Pair", 
+                    "Center_Frequency_MHz": round(center, 5),
+                    "Relative_Intensity": round(float((found_y[i] + found_y[i+1])/2.0), 5), 
+                    "Doppler_Split_MHz": round(split, 5)
+                })
+                i += 2 
+            else:
+                # Single line detected
+                line = self.ax.axvline(x=f1, color='orange', linestyle=':', alpha=0.8)
+                self.selections.append(line)
+                
+                log_entry = f"AUTO Single | Freq:   {f1:.4f}"
+                self.log_list.insert(tk.END, log_entry)
+                self.log_list.yview(tk.END)
+                
+                self.peak_data.append({
+                    "Type": "Auto Single", 
+                    "Center_Frequency_MHz": round(f1, 5),
+                    "Relative_Intensity": round(float(found_y[i]), 5), 
+                    "Doppler_Split_MHz": 0.0
+                })
+                i += 1 
+                
+        self.canvas.draw()
+
+    # ---------------------------------------------------------
+    # PATTERN-AWARE AUTO-ASSIGNMENT LOGIC
+    # ---------------------------------------------------------
+    def auto_assign(self):
+        if not self.peak_data:
+            self.log_list.insert(tk.END, "ERROR: Find experimental peaks first!")
+            self.log_list.yview(tk.END)
+            return
+            
+        fname = filedialog.askopenfilename(
+            title="Select Predicted File (.freq or .pred)", 
+            filetypes=[("Prediction Files", "*.freq *.pred"), ("All Files", "*.*")]
+        )
+        if not fname: return
+        
+        try: tolerance = float(self.assign_tol_var.get())
+        except ValueError:
+            self.log_list.insert(tk.END, "ERROR: Invalid Assign Tolerance!")
+            return
+
+        predictions = []
+        try:
+            with open(fname, 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if not parts: continue
+                    floats = []
+                    for p in parts:
+                        try: floats.append(float(p))
+                        except ValueError: pass
+                    freq_candidates = [x for x in floats if x > 1000]
+                    if freq_candidates:
+                        freq = freq_candidates[0]
+                        predictions.append({'freq': freq, 'full_line': line.strip()})
+        except Exception as e:
+            self.log_list.insert(tk.END, f"Failed to read file: {e}")
+            return
+
+        if not predictions:
+            self.log_list.insert(tk.END, "Could not find valid frequencies inside that file!")
+            return
+
+        exp_freqs = sorted([p['Center_Frequency_MHz'] for p in self.peak_data])
+        min_exp = min(exp_freqs)
+        max_exp = max(exp_freqs)
+        
+        MAX_GLOBAL_SHIFT = 150.0 
+        local_preds = [p for p in predictions if (min_exp - MAX_GLOBAL_SHIFT) <= p['freq'] <= (max_exp + MAX_GLOBAL_SHIFT)]
+        
+        if not local_preds:
+            self.log_list.insert(tk.END, f"ERROR: No predicted lines found within {MAX_GLOBAL_SHIFT} MHz of your peaks.")
+            self.log_list.yview(tk.END)
+            return
+
+        best_shift = 0.0
+        best_matches = []
+        max_match_count = 0
+        best_error_sum = float('inf')
+
+        try:
+            for exp_f in exp_freqs:
+                for pred_p in local_preds:
+                    test_shift = exp_f - pred_p['freq']
+                    current_matches = []
+                    error_sum = 0.0
+                    available_preds = list(local_preds) 
+                    
+                    for e_f in exp_freqs:
+                        best_local_diff = float('inf')
+                        best_local_match = None
+                        
+                        for ap in available_preds:
+                            shifted_p_freq = ap['freq'] + test_shift
+                            diff = abs(e_f - shifted_p_freq)
+                            
+                            if diff <= tolerance and diff < best_local_diff:
+                                best_local_diff = diff
+                                best_local_match = ap
+                                
+                        if best_local_match:
+                            current_matches.append({
+                                'exp': e_f,
+                                'pred': best_local_match,
+                                'diff': e_f - best_local_match['freq'] 
+                            })
+                            available_preds.remove(best_local_match) 
+                            error_sum += best_local_diff
+                            
+                    if len(current_matches) > max_match_count:
+                        max_match_count = len(current_matches)
+                        best_matches = current_matches
+                        best_shift = test_shift
+                        best_error_sum = error_sum
+                    elif len(current_matches) == max_match_count and len(current_matches) > 0:
+                        if error_sum < best_error_sum:
+                            best_matches = current_matches
+                            best_shift = test_shift
+                            best_error_sum = error_sum
+        except Exception as e:
+            self.log_list.insert(tk.END, f"Calculation Error: {e}")
+            self.log_list.yview(tk.END)
+            return
+
+        self.log_list.insert(tk.END, "")
+        self.log_list.insert(tk.END, f"=== PATTERN ASSIGNMENT (Tol: {tolerance} MHz) ===")
+        
+        if max_match_count == 0:
+            self.log_list.insert(tk.END, "No overlapping patterns found.")
+            self.log_list.insert(tk.END, "="*55)
+            self.log_list.yview(tk.END)
+            return
+
+        self.log_list.insert(tk.END, f"Found Pattern! Recognized Global Shift: {best_shift:+.4f} MHz")
+        self.log_list.insert(tk.END, f"Matched {max_match_count} out of {len(exp_freqs)} experimental peaks.")
+        
+        export_lines = []
+        export_lines.append(f"# Pattern-Assigned Predictions")
+        export_lines.append(f"# Tolerance: {tolerance} MHz | Recognized Global Shift: {best_shift:+.4f} MHz")
+        export_lines.append(f"# Obs_Freq(MHz)    Calc_Freq(MHz)    O-C_Diff    Original_Prediction_Line")
+        export_lines.append("-" * 85)
+
+        best_matches.sort(key=lambda x: x['exp'])
+
+        for m in best_matches:
+            exp_freq = m['exp']
+            pred = m['pred']
+            diff_val = m['diff']
+            self.log_list.insert(tk.END, f"MATCH -> Obs: {exp_freq:.4f} | Calc: {pred['freq']:.4f} | O-C: {diff_val:+.4f}")
+            export_line = f"{exp_freq:.4f}    {pred['freq']:.4f}    {diff_val:+.4f}    {pred['full_line']}"
+            export_lines.append(export_line)
+
+        save_name = filedialog.asksaveasfilename(
+            title="Save Pattern Assignments",
+            defaultextension=".pred",
+            filetypes=[("Assigned Prediction File", "*.pred"), ("Frequency File", "*.freq"), ("Text File", "*.txt")]
+        )
+        if save_name:
+            try:
+                with open(save_name, 'w') as f:
+                    f.write("\n".join(export_lines))
+                self.log_list.insert(tk.END, f">>> SUCCESS: Saved {max_match_count} pattern matches.")
+            except Exception as e:
+                self.log_list.insert(tk.END, f"ERROR saving file: {e}")
+                
+        self.log_list.insert(tk.END, "="*55)
+        self.log_list.yview(tk.END)
+
+    # ---------------------------------------------------------
+    # MULTI-FORMAT EXPORT 
+    # ---------------------------------------------------------
+    def export_peaks_data(self):
+        if len(self.peak_data) == 0: return
+        fname = filedialog.asksaveasfilename(
+            defaultextension=".dat", 
+            filetypes=[("PGOPHER Stick Data", "*.dat"), ("CSV File", "*.csv"), ("Detailed Text", "*.txt"), ("JSON File", "*.json")]
+        )
+        if not fname: return
+
+        try:
+            ext = os.path.splitext(fname)[1].lower()
+            sorted_peaks = sorted(self.peak_data, key=lambda row: float(row['Center_Frequency_MHz']))
+
+            if ext == '.csv':
+                with open(fname, mode='w', newline='', encoding='utf-8') as file:
+                    writer = csv.DictWriter(file, fieldnames=["Type", "Center_Frequency_MHz", "Relative_Intensity", "Doppler_Split_MHz"])
+                    writer.writeheader()
+                    for row in sorted_peaks: writer.writerow(row)
+            elif ext == '.txt':
+                with open(fname, mode='w', encoding='utf-8') as file:
+                    file.write(f"{'Type':<18} {'Center (MHz)':<15} {'Intensity':<12} {'Split (MHz)':<12}\n")
+                    file.write("-" * 60 + "\n")
+                    for row in sorted_peaks:
+                        file.write(f"{row['Type']:<18} {row['Center_Frequency_MHz']:<15} {row['Relative_Intensity']:<12} {row['Doppler_Split_MHz']:<12}\n")
+            elif ext == '.dat':
+                with open(fname, mode='w', encoding='utf-8') as file:
+                    for row in sorted_peaks:
+                        freq = round(float(row['Center_Frequency_MHz']), 3)
+                        intensity = row['Relative_Intensity']
+                        if intensity == "N/A": intensity = 1.000
+                        else: intensity = float(intensity)
+                        file.write(f"{freq - 0.001:.3f} 0.000\n")
+                        file.write(f"{freq:.3f} {intensity:.5f}\n")
+                        file.write(f"{freq + 0.001:.3f} 0.000\n")
+            elif ext == '.json':
+                with open(fname, mode='w', encoding='utf-8') as file:
+                    json.dump(sorted_peaks, file, indent=4)
+        except Exception as e: print(f"Failed to export data: {e}")
+
+    # ---------------------------------------------------------
+    # MANUAL CLICK LOGIC
+    # ---------------------------------------------------------
+    def on_click(self, event):
+        if event.inaxes != self.ax: return
+        if event.button == 3: # Right Click
+            freq = event.xdata
+            line = self.ax.axvline(x=freq, color='green', linewidth=1.5, alpha=0.8)
+            self.selections.append(line)
+            t = self.ax.text(freq, 0.05, f"{freq:.4f}", rotation=90, color="green", 
+                             verticalalignment='bottom', backgroundcolor='white')
+            self.selections.append(t)
+            self.selected_freqs.append(freq)
+            
+            if len(self.selected_freqs) % 2 == 0:
+                f2, f1 = self.selected_freqs[-1], self.selected_freqs[-2]
+                center_freq = (f1 + f2) / 2.0
+                doppler_split = abs(f1 - f2)
+                freq_sum = f1 + f2
+                
+                msg = f"Center: {center_freq:.4f}\nSplit: {doppler_split:.4f}"
+                t_lbl = self.ax.text(center_freq, 0.5, msg, 
+                                     color="blue", fontweight="bold", ha="center", va="bottom",
+                                     bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="blue"))
+                self.selections.append(t_lbl)
+                
+                log_entry = f"MANUAL Pair | Center: {center_freq:.4f} | Split: {doppler_split:.4f} | Sum: {freq_sum:.4f}"
+                self.log_list.insert(tk.END, log_entry)
+                self.log_list.yview(tk.END)
+                self.peak_data.append({
+                    "Type": "Manual Pair", "Center_Frequency_MHz": round(center_freq, 5),
+                    "Relative_Intensity": "N/A", "Doppler_Split_MHz": round(doppler_split, 5)
+                })
+            self.canvas.draw()
+
+    def clear_lines(self):
+        for artist in self.selections:
+            try: artist.remove()
+            except: pass
+        self.selections = []
+        self.selected_freqs = []
+        self.canvas.draw()
+
+    def clear_log(self):
+        self.log_list.delete(0, tk.END)
+        self.peak_data = [] 
+
+    def copy_to_clipboard(self):
+        items = self.log_list.get(0, tk.END)
+        text_to_copy = "\n".join(items)
+        self.clipboard_clear()
+        self.clipboard_append(text_to_copy)
+        self.update()
+
+if __name__ == "__main__":
+    app = SpectrumApp()
+    app.mainloop()
