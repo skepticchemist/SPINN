@@ -1109,19 +1109,19 @@ def run_fit(vary_list):
 
     prev_rms = None
     for it in range(max(1, Run.NCY)):
-        print(f"Iter {it+1}...")
-            
         r0 = get_residuals(p_vec)
+        
+        # Calculate unweighted RMS for printing to terminal
+        raw_rms_current = np.sqrt(np.mean(r0**2))
+        print(f" Iteration {it+1:2d} ... RMS: {raw_rms_current:.6f} MHz")
         
         current_rss = np.sum([ln.weight * ln.res**2 for ln in Run.LINES])
         current_rms = np.sqrt(current_rss / max(1, len(Run.LINES)))
         
-        if P.OLVL > 0: print(f"  Current RMS: {current_rms:.6f}")
-        
         if prev_rms is not None:
             frac_change = abs(prev_rms - current_rms) / (prev_rms + 1e-20)
             if frac_change < P.FTH:
-                if P.OLVL > 0: print(f"  Converged! RMS change ({frac_change:.6f}) < FTH ({P.FTH})")
+                print(" Converged! RMS change is less than FTH.")
                 break
         prev_rms = current_rms
         
@@ -1150,15 +1150,16 @@ def run_fit(vary_list):
         p_vec += delta_p
         
         if np.max(np.abs(delta_p)) < 1e-7: 
-            if P.OLVL > 0: print("  Converged! Parameter shifts approach 0.")
+            print(" Converged! Parameter shifts are negligible.")
             break
 
-    print()
     r_fin = get_residuals(p_vec)
     RSS = np.sum([ln.weight * ln.res**2 for ln in Run.LINES])
     dof = max(1, len(Run.LINES) - len(p_vec))
     rms_fit = np.sqrt(RSS/len(Run.LINES))
     raw_rms = np.sqrt(np.mean(r_fin**2))
+    
+    print(f" Final RMS: {raw_rms:.6f} MHz")
     
     Cov = np.linalg.pinv(Jac.T @ W @ Jac) * (RSS/dof)
     diag_cov = np.diag(Cov).copy()
