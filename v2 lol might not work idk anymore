@@ -1821,6 +1821,12 @@ def write_freq_file(filename):
     if trans:
         max_i = max(t['i_abs'] for t in trans)
         for t in trans: t['i'] = math.log10((t['i_abs']/max_i) + 1e-35)
+        
+        # --- LINT FILTERING ADDED HERE ---
+        # Gets your LINT from the parser, defaults to -99 if not in input file
+        lint_threshold = getattr(P, 'LINT', getattr(P, 'LInt', -99.0))
+        trans = [t for t in trans if t['i'] >= lint_threshold]
+        
     trans.sort(key=lambda x: x['f'])
     
     with open(filename, 'w') as f:
