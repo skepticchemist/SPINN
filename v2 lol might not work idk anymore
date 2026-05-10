@@ -142,10 +142,12 @@ class P:
     Xaa = Xbb_Xcc = Xab = Xac = Xbc = 0.0
     Xaa2 = Xbb_Xcc2 = Xab2 = Xac2 = Xbc2 = 0.0
     Xaa3 = Xbb_Xcc3 = Xab3 = Xac3 = Xbc3 = 0.0
+    Xaa4 = Xbb_Xcc4 = Xab4 = Xac4 = Xbc4 = 0.0
+    Xaa5 = Xbb_Xcc5 = Xab5 = Xac5 = Xbc5 = 0.0
     Xaa_p = Xaa_m = Xbb_Xcc_p = Xbb_Xcc_m = Xab_p = Xab_m = Xac_p = Xac_m = Xbc_p = Xbc_m = 0.0
     
     Eaa = Ebb = Ecc = 0.0; Eab = Ebc = Eac = 0.0
-    Caa = Cbb = Ccc = Caa2 = Cbb2 = Ccc2 = Caa3 = Cbb3 = Ccc3 = 0.0
+    Caa = Cbb = Ccc = Caa2 = Cbb2 = Ccc2 = Caa3 = Cbb3 = Ccc3 = Caa4 = Cbb4 = Ccc4 = Caa5 = Cbb5 = Ccc5 = 0.0
     Caa_p = Caa_m = Cbb_p = Cbb_m = Ccc_p = Ccc_m = 0.0
     
     AF = TAA = TBB_TCC = AF2 = TAA2 = TBB_TCC2 = AF3 = TAA3 = TBB_TCC3 = 0.0
@@ -210,7 +212,7 @@ def parse_input(path: str) -> None:
             }
             if key in alias_map: key = alias_map[key]
 
-            if key in ['FORMAT', 'TEMP','MUA','MUB','MUC','S','LINT','FMIN','FMAX','JMIN','JMAX','ITER','REDUCTION','REP', 'FTH', 'FDIF', 'OLVL', 'DUMP', 'PUBL', 'DIAG', 'EQQ_I', 'VT_MAX', 'STATISTICS']:
+            if key in ['FORMAT', 'TEMP','MUA','MUB','MUC','LINT','FMIN','FMAX','JMIN','JMAX','ITER','REDUCTION','REP', 'FTH', 'FDIF', 'OLVL', 'DUMP', 'PUBL', 'DIAG', 'EQQ_I', 'VT_MAX', 'STATISTICS']:
                 try:
                     if key in ['JMIN','JMAX','ITER', 'OLVL', 'PUBL', 'DIAG', 'VT_MAX', 'STATISTICS']: val = int(float(parts[1]))
                     elif key in ['REDUCTION','REP', 'FORMAT']: val = parts[1]
@@ -345,97 +347,49 @@ def parse_input(path: str) -> None:
         if hasattr(Run, f"INIT_{attr}"): setattr(Run, f"INIT_{attr}", getattr(P, attr))
         
     if trans_start != -1:
+        num_nuc_spins = len([s for s in P.SPINS if s > 1e-5])
         for line in lines[trans_start+1:]:
             p = line.split()
             if len(p) < 8: continue
             try:
-                # Always grab freq and error from the exact end of the line
-                freq = float(p[-2])
-                err = float(p[-1])
-                weight = 1.0/(err**2) if err > 1e-9 else 0.0
-
-                qn = p[:-2]
-                sym = None
-                
-                if len(qn) % 2 != 0:
-                    sym = int(float(qn[-1]))
-                    qn = qn[:-1]
-                    
-                half = len(qn) // 2
-                u_qn = qn[:half]
-                l_qn = qn[half:]
-                
-                # --- AUTO DETECT SPFIT DOUBLED J QUANTUM NUMBERS ---
-                div = 1.0
-                if P.FORMAT == 'SR' and half > 3:
-                    n_val = float(u_qn[0])
-                    j_raw = float(u_qn[3])
-                    S_spin = getattr(P, 'S', 0.5)
-                    # If J is physically impossible, but J/2 IS possible, auto-divide!
-                    if abs(j_raw - (n_val + S_spin)) > 1e-3 and abs(j_raw - abs(n_val - S_spin)) > 1e-3:
-                        if abs(j_raw/2.0 - (n_val + S_spin)) < 1e-3 or abs(j_raw/2.0 - abs(n_val - S_spin)) < 1e-3:
-                            div = 2.0
-                            
-                # --- AUTO-PAD MISSING SPINS ---
-                if P.FORMAT == 'SR':
-                    exp_spins = half - 4
-                    while len(P.SPINS) < exp_spins: P.SPINS.append(0.5)
-                elif P.FORMAT == '3SPIN':
-                    exp_spins = half - 3
-                    while len(P.SPINS) < exp_spins: P.SPINS.append(0.5)
-                
-                kwargs = {}
-                if P.FORMAT == 'SR':
-                    if half > 3:
-                        kwargs['J1'] = float(u_qn[3]) / div
-                        kwargs['J2'] = float(l_qn[3]) / div
-                    if half > 4:
-                        kwargs['F1_1'] = float(u_qn[4]) / div
-                        kwargs['F2_1'] = float(l_qn[4]) / div
-                    if half > 5:
-                        kwargs['F1_2'] = float(u_qn[5]) / div
-                        kwargs['F2_2'] = float(l_qn[5]) / div
-                    if half > 6:
-                        kwargs['F1_3'] = float(u_qn[6]) / div
-                        kwargs['F2_3'] = float(l_qn[6]) / div
-                    if half > 7:
-                        kwargs['F1_4'] = float(u_qn[7]) / div
-                        kwargs['F2_4'] = float(l_qn[7]) / div
-                    if half > 4:
-                        kwargs['F1'] = float(u_qn[-1]) / div
-                        kwargs['F2'] = float(l_qn[-1]) / div
-                elif P.FORMAT == '3SPIN':
-                    if half > 3:
-                        kwargs['F1_1'] = float(u_qn[3]) / div
-                        kwargs['F2_1'] = float(l_qn[3]) / div
-                    if half > 4:
-                        kwargs['F1_2'] = float(u_qn[4]) / div
-                        kwargs['F2_2'] = float(l_qn[4]) / div
-                    if half > 5:
-                        kwargs['F1_3'] = float(u_qn[5]) / div
-                        kwargs['F2_3'] = float(l_qn[5]) / div
-                    if half > 6:
-                        kwargs['F1_4'] = float(u_qn[6]) / div
-                        kwargs['F2_4'] = float(l_qn[6]) / div
-                    if half > 3:
-                        kwargs['F1'] = float(u_qn[-1]) / div
-                        kwargs['F2'] = float(l_qn[-1]) / div
+                if P.FORMAT in ['SR', '3SPIN']:
+                    if num_nuc_spins == 5 and len(p) >= 20:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[9]), int(p[10]), int(p[11]), float(p[18]), 1.0, float(p[19]),
+                                 J1=float(p[3]), F1_1=float(p[4]), F1_2=float(p[5]), F1_3=float(p[6]), F1_4=float(p[7]), F1=float(p[8]),
+                                 J2=float(p[12]), F2_1=float(p[13]), F2_2=float(p[14]), F2_3=float(p[15]), F2_4=float(p[16]), F2=float(p[17]))
+                    elif num_nuc_spins == 4 and len(p) >= 18:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[8]), int(p[9]), int(p[10]), float(p[16]), 1.0, float(p[17]),
+                                 J1=float(p[3]), F1_1=float(p[4]), F1_2=float(p[5]), F1_3=float(p[6]), F1=float(p[7]),
+                                 J2=float(p[11]), F2_1=float(p[12]), F2_2=float(p[13]), F2_3=float(p[14]), F2=float(p[15]))
+                    elif num_nuc_spins == 3 and len(p) >= 16:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[7]), int(p[8]), int(p[9]), float(p[14]), 1.0, float(p[15]),
+                                 J1=float(p[3]), F1_1=float(p[4]), F1_2=float(p[5]), F1=float(p[6]),
+                                 J2=float(p[10]), F2_1=float(p[11]), F2_2=float(p[12]), F2=float(p[13]))
+                    elif num_nuc_spins == 2 and len(p) >= 14:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[6]), int(p[7]), int(p[8]), float(p[12]), 1.0, float(p[13]),
+                                 J1=float(p[3]), F1_1=float(p[4]), F1=float(p[5]),
+                                 J2=float(p[9]), F2_1=float(p[10]), F2=float(p[11]))
+                    elif num_nuc_spins <= 1 and len(p) >= 12:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[5]), int(p[6]), int(p[7]), float(p[10]), 1.0, float(p[11]),
+                                 J1=float(p[3]), F1=float(p[4]), J2=float(p[8]), F2=float(p[9]))
+                    else: continue
                 else: 
-                    if half > 3:
-                        kwargs['F1'] = float(u_qn[-1]) / div
-                        kwargs['F2'] = float(l_qn[-1]) / div
-                    if half > 4:
-                        kwargs['I1'] = float(u_qn[3]) / div
-                        kwargs['I2'] = float(l_qn[3]) / div
-                        
-                l = Line(int(u_qn[0]), int(u_qn[1]), int(u_qn[2]), 
-                         int(l_qn[0]), int(l_qn[1]), int(l_qn[2]), 
-                         freq, weight, err, **kwargs)
-                         
-                if sym is not None: l.Sym = sym
+                    if num_nuc_spins >= 2 and len(p) >= 12:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[5]), int(p[6]), int(p[7]), float(p[10]), 1.0, float(p[11]), 
+                                 I1=float(p[3]), F1=float(p[4]), I2=float(p[8]), F2=float(p[9]))
+                        if len(p) >= 13: l.Sym = int(float(p[12]))
+                    elif num_nuc_spins == 1 and len(p) >= 10:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[4]), int(p[5]), int(p[6]), float(p[8]), 1.0, float(p[9]), 
+                                 F1=float(p[3]), F2=float(p[7]))
+                        if len(p) >= 11: l.Sym = int(float(p[10]))
+                    elif len(p) >= 8:
+                        l = Line(int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]), int(p[5]), float(p[6]), 1.0, float(p[7]))
+                        if len(p) >= 9: l.Sym = int(float(p[8]))
+                    else: continue
+
+                l.weight = 1.0/(l.error**2) if l.error > 1e-9 else 0.0
                 Run.LINES.append(l)
-            except Exception as e: 
-                continue
+            except: continue
 # =================================================================== #
 # 4. Pure Rotational Matrix Builders (Base Framework)                 #
 # =================================================================== #
@@ -1843,6 +1797,7 @@ def write_freq_file(filename):
                                     freq = u_hfs['E'] - l_hfs['E']
                                     if freq < P.FMIN or freq > P.FMAX: continue
                                     
+                                    # Fallback intensity in case calc_matrix_intensity isn't defined
                                     try: S = calc_matrix_intensity(u_hfs, l_hfs, Ju, Jl, P.FORMAT)
                                     except NameError: S = 1.0
                                     
@@ -1866,12 +1821,6 @@ def write_freq_file(filename):
     if trans:
         max_i = max(t['i_abs'] for t in trans)
         for t in trans: t['i'] = math.log10((t['i_abs']/max_i) + 1e-35)
-        
-        # --- LINT FILTERING ADDED HERE ---
-        # Gets your LINT from the parser, defaults to -99 if not in input file
-        lint_threshold = getattr(P, 'LINT', getattr(P, 'LInt', -99.0))
-        trans = [t for t in trans if t['i'] >= lint_threshold]
-        
     trans.sort(key=lambda x: x['f'])
     
     with open(filename, 'w') as f:
@@ -1880,7 +1829,7 @@ def write_freq_file(filename):
         
         if P.FORMAT == 'SR':
             if num_nuc_spins >= 5: f.write(f"Frequency      LogInt     N Ka Kc    J   F1   F2   F3   F4    F                N Ka Kc    J   F1   F2   F3   F4    F          (Up - Low)\n")
-            elif num_nuc_spins >= 4: f.write(f"Frequency      LogInt     N Ka Kc    J   F1   F2   F3    F                      N Ka Kc    J   F1   F2   F3    F               (Up - Low)\n")
+            elif num_nuc_spins >= 4: f.write(f"Frequency      LogInt     N Ka Kc    J   F1   F2   F3    F                     N Ka Kc    J   F1   F2   F3    F               (Up - Low)\n")
             elif num_nuc_spins >= 3: f.write(f"Frequency      LogInt     N Ka Kc    J   F1   F2    F      N Ka Kc    J   F1   F2    F    (Up - Low)\n")
             elif num_nuc_spins == 2: f.write(f"Frequency      LogInt     N Ka Kc    J   F1    F            N Ka Kc    J   F1    F       (Up - Low)\n")
             elif num_nuc_spins == 1: f.write(f"Frequency      LogInt     N Ka Kc    J    F                 N Ka Kc    J    F          (Up - Low)\n")
@@ -1889,7 +1838,7 @@ def write_freq_file(filename):
             if num_nuc_spins >= 3: f.write(f"Frequency      LogInt     J Ka Kc   F1   F2    F         J Ka Kc   F1   F2    F       (Up - Low)\n")
             elif num_nuc_spins == 2: f.write(f"Frequency      LogInt     J Ka Kc   F1    F                J Ka Kc   F1    F          (Up - Low)\n")
             elif num_nuc_spins == 1: f.write(f"Frequency      LogInt     J Ka Kc    F                     J Ka Kc    F               (Up - Low)\n")
-            else: f.write(f"Frequency      LogInt     J Ka Kc                              J Ka Kc                         (Up - Low)\n")
+            else: f.write(f"Frequency      LogInt     J Ka Kc                              J Ka Kc                        (Up - Low)\n")
         else: # SRR
             if num_nuc_spins >= 2: f.write(f"Frequency      LogInt     J Ka Kc    I    F                J Ka Kc    I    F          (Up - Low)\n")
             elif num_nuc_spins == 1: f.write(f"Frequency      LogInt     J Ka Kc    F                     J Ka Kc    F               (Up - Low)\n")
@@ -1897,7 +1846,6 @@ def write_freq_file(filename):
             
         f.write("-------------------------------------------------------------------------------------------------------\n")
         for t in trans: f.write(f"   {t['f']:10.4f}       {t['i']:7.4f}   {t['qs']}\n")
-        
 
 def main():
     in_file = "3top_input.txt"
